@@ -8,12 +8,27 @@ import time
 from evdev import InputDevice, UInput, categorize, ecodes, list_devices
 from loguru import logger
 
-sys.path.extend([".", ".."])
-import settings
+
+class SingletonMeta(type):
+    _instances = {}
+
+    def __call__(cls, *args, **kwargs):
+        if cls not in cls._instances:
+            instance = super().__call__(*args, **kwargs)
+            cls._instances[cls] = instance
+        return cls._instances[cls]
 
 
-class DeviceMacro:
-    def __init__(self, mouse_name: str = "MOUSE", keyboard_name: str = "USB Keyboard"):
+class DeviceMacro(metaclass=SingletonMeta):
+    def __init__(
+        self,
+        mouse_name: str = "MOUSE",
+        keyboard_name: str = "USB Keyboard",
+        *,
+        mouse_sleep_ms=30,
+        space_sleep_ms=150,
+        mouse_hold_ms_list=(0, 600, 700),
+    ):
         # 获取鼠标设备
         for device_path in list_devices():
             device = InputDevice(device_path)
@@ -33,13 +48,24 @@ class DeviceMacro:
         if not keyboard:
             logger.error("Keyboard not found")
 
+        # 设置鼠标和键盘设备
         self.mouse = mouse
         self.keyboard = keyboard
 
+        # 设置全局变量，表示按键的状态
         self.right_button_held = False
         self.space_locked = False
 
-    def click_thread(self, ui: UInput = None, sleep_ms=settings.click_ms):
+        # 设置按键间隔时间
+        self.mouse_sleep_ms = mouse_sleep_ms
+        self.space_sleep_ms = space_sleep_ms
+
+        # 设置按键按住的时间
+        self.mouse_hold_ms_list = mouse_hold_ms_list
+        self.mouse_hold_ms_index = 0
+        self.mouse_hold_ms = self.mouse_hold_ms_list[self.mouse_hold_ms_index]
+
+    def click_thread(self, ui: UInput = None):
         count = 0
         device = ui or self.mouse
         while self.right_button_held:
@@ -49,6 +75,9 @@ class DeviceMacro:
                 # 同步鼠标事件
                 device.syn()
 
+            # 按住时间
+            time.sleep(self.mouse_hold_ms / 1000)
+
             # 模拟鼠标左键释放
             device.write(ecodes.EV_KEY, ecodes.BTN_LEFT | ecodes.BTN_MOUSE, 0)
             if ui:
@@ -56,13 +85,13 @@ class DeviceMacro:
                 device.syn()
 
             # 等待事件响应
-            time.sleep(sleep_ms / 1000)
+            time.sleep(self.mouse_sleep_ms / 1000)
 
             # 打印点击次数
             logger.info(f"Click count: {count}")
             count += 1
 
-    def space_thread(self, ui: UInput = None, sleep_ms=settings.space_ms):
+    def space_thread(self, ui: UInput = None):
         count = 0
         device = ui or self.keyboard
         while self.space_locked:
@@ -74,7 +103,7 @@ class DeviceMacro:
                 device.syn()
 
             # 等待事件响应
-            time.sleep(sleep_ms / 1000)
+            time.sleep(self.space_sleep_ms / 1000)
 
             # 打印点击次数
             logger.info(f"Space count: {count}")
@@ -124,7 +153,6 @@ class DeviceMacro:
         mouse_u: UInput = None,
         keyboard_u: UInput = None,
         *,
-        sleep_ms=settings.click_ms,
         use_proxy=False,
     ):
         logger.debug(f"Mouse event: {event}")
@@ -141,9 +169,7 @@ class DeviceMacro:
         match key_event.keycode, key_event.keystate:
             case "BTN_RIGHT", key_event.key_down:
                 self.right_button_held = True
-                threading.Thread(
-                    target=self.click_thread, args=(mouse_u, sleep_ms)
-                ).start()
+                threading.Thread(target=self.click_thread, args=(mouse_u,)).start()
             case "BTN_RIGHT", key_event.key_up:
                 self.right_button_held = False
             case "BTN_EXTRA", key_event.key_down:
@@ -162,14 +188,19 @@ class DeviceMacro:
                 keyboard.write(ecodes.EV_KEY, ecodes.KEY_2, 0)
                 if keyboard_u:
                     keyboard_u.syn()
+            case "BTN_MIDDLE", key_event.key_down:
+                # 切换鼠标按住时间
+                self.mouse_hold_ms_index = (self.mouse_hold_ms_index + 1) % len(
+                    self.mouse_hold_ms_list
+                )
+                self.mouse_hold_ms = self.mouse_hold_ms_list[self.mouse_hold_ms_index]
+                logger.info(f"Mouse hold time: {self.mouse_hold_ms} ms")
             case _, _:
                 if use_proxy:
                     # 代理鼠标事件
                     mouse_u.write_event(event)
 
-    def handle_keyboard(
-        self, event, ui: UInput = None, *, sleep_ms=settings.space_ms, use_proxy=False
-    ):
+    def handle_keyboard(self, event, ui: UInput = None, *, use_proxy=False):
         logger.debug(f"Keyboard event: {event}")
 
         if event.type != ecodes.EV_KEY:
@@ -184,16 +215,12 @@ class DeviceMacro:
         match key_event.keycode, key_event.keystate:
             case "KEY_SPACE", key_event.key_down:
                 self.space_locked = True
-                threading.Thread(
-                    target=self.space_thread, args=(device, sleep_ms)
-                ).start()
+                threading.Thread(target=self.space_thread, args=(device,)).start()
             case "KEY_SPACE", key_event.key_up:
                 self.space_locked = False
             case "KEY_Q", key_event.key_down:
                 self.space_locked = not self.space_locked
-                threading.Thread(
-                    target=self.space_thread, args=(device, sleep_ms)
-                ).start()
+                threading.Thread(target=self.space_thread, args=(device,)).start()
             case _, _:
                 if use_proxy:
                     # 代理键盘事件
@@ -202,8 +229,6 @@ class DeviceMacro:
     def run(
         self,
         *,
-        mouse_ms=settings.click_ms,
-        space_ms=settings.space_ms,
         use_uinput=True,
         use_proxy=False,
         virtual_mouse_name="Virtual Mouse",
@@ -230,9 +255,9 @@ class DeviceMacro:
 
                 for event in device.read():
                     if device == self.mouse:
-                        self.handle_mouse(event, mouse_u, sleep_ms=mouse_ms)
+                        self.handle_mouse(event, mouse_u)
                     elif device == self.keyboard:
-                        self.handle_keyboard(event, keyboard_u, sleep_ms=space_ms)
+                        self.handle_keyboard(event, keyboard_u)
 
 
 # %%
